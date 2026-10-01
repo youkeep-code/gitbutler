@@ -67,6 +67,87 @@ Error: 'kp' is ambiguous - it matches more than one uncommitted change. Use more
 }
 
 #[test]
+fn absorbs_ancestor_changes_before_descendant_changes() {
+    let env = Sandbox::init_scenario_with_target_and_default_settings("absorb-parent-before-child");
+    env.setup_metadata_at_target(&["B", "A"], "origin/main");
+    let padding = "/* padding */\n".repeat(12);
+    let source = format!(
+        "static unsigned long domain_reduce_node_claims(void)\n\
+         {{\n\
+         \x20   unsigned long released = 0;\n\
+         \x20   unsigned int node;\n\
+         \n\
+         \x20   for ( node = 0; node < 8; ++node )\n\
+         \x20       released += node;\n\
+         \n\
+         \x20   return released;\n\
+         }}\n\
+         \n\
+         {padding}\
+         void release_claims(void)\n\
+         {{\n\
+         \x20   domain_reduce_node_claims();\n\
+         }}\n\
+         \n\
+         {padding}\
+         void unset_claims(void)\n\
+         {{\n\
+         \x20   domain_reduce_node_claims();\n\
+         }}\n\
+         \n\
+         {padding}\
+         void redeem_claims(void)\n\
+         {{\n\
+         \x20   domain_reduce_node_claims();\n\
+         }}\n"
+    );
+    env.file("claims.c", source);
+
+    let output = env.but("absorb").output().unwrap();
+    assert!(
+        output.status.success(),
+        "absorb should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Failed to absorb"),
+        "all dependent hunks should be absorbed: {stdout}"
+    );
+    let ancestor_absorption = stdout
+        .find("add claim release call sites")
+        .unwrap_or_else(|| panic!("ancestor commit should appear in the plan:\n{stdout}"));
+    let descendant_absorption = stdout
+        .find("redeem claims during allocation")
+        .unwrap_or_else(|| panic!("descendant commit should appear in the plan:\n{stdout}"));
+    assert!(
+        ancestor_absorption < descendant_absorption,
+        "ancestor changes must be absorbed before descendant changes: {stdout}"
+    );
+
+    let status = util::status_json(&env);
+    assert_eq!(
+        status["uncommittedChanges"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0,
+        "the changes to both commits should be absorbed"
+    );
+
+    let parent_diff = env.invoke_git("show A --format= -- claims.c");
+    assert!(
+        parent_diff.contains("+    domain_reduce_node_claims();"),
+        "the ancestor's call sites should be absorbed into A; output:\n{stdout}\ncommit diff:\n{parent_diff}"
+    );
+    let child_diff = env.invoke_git("show B --format= -- claims.c");
+    assert!(
+        child_diff.contains("+static unsigned long domain_reduce_node_claims(void)"),
+        "the descendant's helper rename should be absorbed into B:\n{child_diff}"
+    );
+}
+
+#[test]
 fn uncommitted_file() {
     let env = Sandbox::init_scenario_with_target_and_default_settings("two-stacks");
 
@@ -413,13 +494,13 @@ Hint: run `but diff` to see uncommitted changes and `but commit -b <branch> -m "
         .stdout_eq(snapbox::str![[r#"
 Found 1 changed file to absorb:
 
-Absorbed to commit: sol partial change to a.txt 2
-  (files locked to commit due to hunk range overlap)
-    a.txt @1,4 +1,4
-
 Absorbed to commit: sll partial change to a.txt 3
   (files locked to commit due to hunk range overlap)
     a.txt @6,4 +6,4
+
+Absorbed to commit: sol partial change to a.txt 2
+  (files locked to commit due to hunk range overlap)
+    a.txt @1,4 +1,4
 
 
 Hint: you can run `but undo` to undo these changes

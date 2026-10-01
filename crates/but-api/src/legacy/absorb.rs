@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, HashMap},
+};
 
 use anyhow::Context as _;
 use bstr::ByteSlice;
@@ -64,6 +67,8 @@ pub fn absorb_with_perm(
     let mut total_rejected = 0;
     let mut commit_map = CommitMap::default();
     let context_lines = ctx.settings.context_lines;
+    let mut absorption_plan = absorption_plan;
+    order_absorptions_for_application(&mut absorption_plan);
 
     for absorption in absorption_plan {
         let diff_specs = convert_hunks_to_diff_specs(&absorption.hunks)?;
@@ -529,7 +534,23 @@ fn prepare_commit_absorptions(
         }
     }
 
+    order_absorptions_for_application(&mut commit_absorptions);
     Ok(commit_absorptions)
+}
+
+/// Apply later file ranges first so line-count changes don't invalidate the
+/// locations of other absorption groups in the same file.
+fn order_absorptions_for_application(absorptions: &mut [CommitAbsorption]) {
+    absorptions.sort_by_key(|absorption| {
+        Reverse(
+            absorption
+                .hunks
+                .iter()
+                .filter_map(|hunk| hunk.hunk_header.map(|header| header.new_start))
+                .min()
+                .unwrap_or_default(),
+        )
+    });
 }
 
 /// Get the commit summary message
@@ -543,6 +564,39 @@ fn get_commit_summary(repo: &gix::Repository, commit_id: gix::ObjectId) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absorption_groups_are_ordered_by_descending_file_position() {
+        let absorption_at = |summary: &str, line| CommitAbsorption {
+            stack_id: StackId::generate(),
+            commit_id: gix::ObjectId::from_hex(b"0000000000000000000000000000000000000000")
+                .expect("valid object ID"),
+            commit_summary: summary.to_owned(),
+            hunks: vec![but_core::SingleHunk {
+                hunk_header: Some(but_core::HunkHeader {
+                    old_start: line,
+                    old_lines: 1,
+                    new_start: line,
+                    new_lines: 1,
+                }),
+                path: "file.txt".into(),
+                diff: None,
+            }],
+            reason: AbsorptionReason::HunkDependency,
+        };
+        let mut absorptions = vec![absorption_at("child", 10), absorption_at("parent", 100)];
+
+        order_absorptions_for_application(&mut absorptions);
+
+        assert_eq!(
+            absorptions
+                .iter()
+                .map(|absorption| absorption.commit_summary.as_str())
+                .collect::<Vec<_>>(),
+            ["parent", "child"],
+            "higher file ranges must be applied before lower ranges"
+        );
+    }
 
     #[test]
     fn candidate_ending_at_a_deletion_point_includes_its_lock() {
